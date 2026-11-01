@@ -28,11 +28,19 @@ internal enum CameraState
 internal sealed class CameraMonitorContext : ApplicationContext
 {
     private const string AppName = "CameraLockMonitor";
-    private const string CameraIdPrefix =
+
+    private const string SamsungCameraPrefix =
         @"USB\VID_2B7E&PID_0171";
 
     private const string RunKeyPath =
         @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    private static readonly HashSet<string> CameraClassGuids =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "{ca3e7ab9-b4c3-4ae6-8251-579ef933890f}",
+            "{6bdd1fc6-810f-11d0-bec7-08002be2092f}"
+        };
 
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusItem;
@@ -44,7 +52,7 @@ internal sealed class CameraMonitorContext : ApplicationContext
 
     private ManagementEventWatcher? _watcher;
 
-    private CameraState _currentState = CameraState.Unknown;
+    private CameraState? _currentState;
     private int _queryRunning;
     private bool _exiting;
 
@@ -73,6 +81,7 @@ internal sealed class CameraMonitorContext : ApplicationContext
         };
 
         _startupItem.Checked = IsStartupEnabled();
+
         _startupItem.CheckedChanged += (_, _) =>
             SetStartup(_startupItem.Checked);
 
@@ -80,12 +89,14 @@ internal sealed class CameraMonitorContext : ApplicationContext
 
         menu.Items.Add(_statusItem);
         menu.Items.Add(new ToolStripSeparator());
+
         menu.Items.Add("Tarkista nyt", null,
             (_, _) => ScheduleRefresh());
 
         menu.Items.Add(_startupItem);
 
         menu.Items.Add(new ToolStripSeparator());
+
         menu.Items.Add("Sulje", null,
             (_, _) => ExitThread());
 
@@ -150,7 +161,7 @@ internal sealed class CameraMonitorContext : ApplicationContext
         }
         catch
         {
-            // Five-second fallback timer remains active.
+            // Fallback timer remains active.
         }
     }
 
@@ -173,7 +184,8 @@ internal sealed class CameraMonitorContext : ApplicationContext
 
         try
         {
-            CameraState state = await Task.Run(ReadCameraState);
+            CameraState state =
+                await Task.Run(ReadCameraState);
 
             if (_exiting || _dispatcher.IsDisposed)
                 return;
@@ -195,40 +207,127 @@ internal sealed class CameraMonitorContext : ApplicationContext
         try
         {
             using var searcher = new ManagementObjectSearcher(
-                "SELECT PNPDeviceID, Status FROM Win32_PnPEntity");
+                "SELECT * FROM Win32_PnPEntity");
 
             using var devices = searcher.Get();
+
+            bool cameraFound = false;
+            bool cameraAvailable = false;
+            bool cameraLocked = false;
+            bool cameraUnknown = false;
 
             foreach (ManagementObject device in devices)
             {
                 string? instanceId =
                     device["PNPDeviceID"]?.ToString();
 
-                if (instanceId == null ||
-                    !instanceId.StartsWith(
-                        CameraIdPrefix,
-                        StringComparison.OrdinalIgnoreCase))
-                {
+                string? pnpClass =
+                    device["PNPClass"]?.ToString();
+
+                string? classGuid =
+                    device["ClassGuid"]?.ToString();
+
+                if (!IsCameraDevice(pnpClass, classGuid))
                     continue;
-                }
+
+                cameraFound = true;
 
                 string status =
                     device["Status"]?.ToString() ?? "";
 
-                return status.ToUpperInvariant() switch
+                int errorCode = 0;
+
+                try
                 {
-                    "OK" => CameraState.Available,
-                    "UNKNOWN" => CameraState.Locked,
-                    _ => CameraState.Unknown
-                };
+                    if (device["ConfigManagerErrorCode"] != null)
+                    {
+                        errorCode = Convert.ToInt32(
+                            device["ConfigManagerErrorCode"]);
+                    }
+                }
+                catch
+                {
+                    // Leave error code as zero.
+                }
+
+                // Windows error code 22:
+                // The device has been disabled.
+                if (errorCode == 22)
+                {
+                    cameraLocked = true;
+                    continue;
+                }
+
+                if (status.Equals(
+                    "OK",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    cameraAvailable = true;
+                    continue;
+                }
+
+                // Samsung-specific behavior observed on the
+                // original test laptop when camera privacy lock
+                // is enabled.
+                if (!string.IsNullOrEmpty(instanceId) &&
+                    instanceId.StartsWith(
+                        SamsungCameraPrefix,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    status.Equals(
+                        "Unknown",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    cameraLocked = true;
+                    continue;
+                }
+
+                cameraUnknown = true;
             }
 
-            return CameraState.Missing;
+            if (!cameraFound)
+                return CameraState.Missing;
+
+            // An available camera takes priority when multiple
+            // cameras are connected.
+            if (cameraAvailable)
+                return CameraState.Available;
+
+            if (cameraLocked)
+                return CameraState.Locked;
+
+            if (cameraUnknown)
+                return CameraState.Unknown;
+
+            return CameraState.Unknown;
         }
         catch
         {
             return CameraState.Unknown;
         }
+    }
+
+    private static bool IsCameraDevice(
+        string? pnpClass,
+        string? classGuid)
+    {
+        if (pnpClass != null &&
+            (pnpClass.Equals(
+                "Camera",
+                StringComparison.OrdinalIgnoreCase) ||
+             pnpClass.Equals(
+                "Image",
+                StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        if (classGuid != null &&
+            CameraClassGuids.Contains(classGuid))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private void ApplyState(CameraState state)
@@ -345,7 +444,9 @@ internal sealed class CameraMonitorContext : ApplicationContext
             string command = $"\"{processPath}\"";
 
             if (Path.GetFileNameWithoutExtension(processPath)
-                .Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+                .Equals(
+                    "dotnet",
+                    StringComparison.OrdinalIgnoreCase))
             {
                 command +=
                     $" \"{Assembly.GetExecutingAssembly().Location}\"";
